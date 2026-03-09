@@ -1,11 +1,11 @@
 [project]
-name = "outlook-desktop-mcp"
-version = "0.2.2"
-description = "Run this on Windows and get Outlook Desktop as an MCP server. No Graph API, no Entra app registration — just your local Outlook."
+name = "outlook-desktop-mcp-encoding"
+version = "0.3.7"
+description = "Fork of outlook-desktop-mcp with encoding fixes"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
-    { name = "Andreas Martin Aanerud", email = "aaanerud@microsoft.com" },
+    { name = "rhdms0327" },
 ]
 keywords = ["mcp", "outlook", "email", "com", "automation", "windows", "microsoft", "claude"]
 classifiers = [
@@ -23,12 +23,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aaanerud/outlook-desktop-mcp"
-Repository = "https://github.com/aaanerud/outlook-desktop-mcp"
-Issues = "https://github.com/aaanerud/outlook-desktop-mcp/issues"
+Homepage = "https://github.com/rhdms0327/outlook-desktop-mcp-encoding"
+Repository = "https://github.com/rhdms0327/outlook-desktop-mcp-encoding"
+Issues = "https://github.com/rhdms0327/outlook-desktop-mcp-encoding/issues"
 
 [project.scripts]
-outlook-desktop-mcp = "outlook_desktop_mcp.server:main"
+outlook-desktop-mcp-encoding = "outlook_desktop_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]

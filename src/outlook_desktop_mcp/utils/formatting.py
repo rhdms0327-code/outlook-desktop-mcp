@@ -1,5 +1,6 @@
 """Helpers for extracting and formatting Outlook item data."""
 import re
+import urllib.parse
 
 from outlook_desktop_mcp.tools._folder_constants import (
     BUSY_STATUS_NAMES,
@@ -22,11 +23,11 @@ def strip_html(html: str) -> str:
     return text
 
 
-def format_email_summary(item) -> dict:
+def format_email_summary(item, encoding: str = "utf-8") -> dict:
     """Extract key fields from an Outlook MailItem into a dict."""
     return {
         "entry_id": item.EntryID,
-        "subject": item.Subject or "(no subject)",
+        "subject": urllib.parse.unquote(item.Subject, encoding=encoding) if item.Subject else "(no subject)",
         "sender": getattr(item, "SenderEmailAddress", "unknown"),
         "sender_name": getattr(item, "SenderName", "unknown"),
         "received_time": str(item.ReceivedTime),
@@ -36,9 +37,9 @@ def format_email_summary(item) -> dict:
     }
 
 
-def format_email_full(item, body_max_length: int = 5000) -> dict:
+def format_email_full(item, body_max_length: int = 5000, encoding: str = "utf-8") -> dict:
     """Extract full email details including body."""
-    result = format_email_summary(item)
+    result = format_email_summary(item, encoding=encoding)
     result["to"] = item.To or ""
     result["cc"] = item.CC or ""
     result["body"] = truncate(item.Body or "", body_max_length)
@@ -48,11 +49,11 @@ def format_email_full(item, body_max_length: int = 5000) -> dict:
 # --- Calendar formatting ---
 
 
-def format_event_summary(item) -> dict:
+def format_event_summary(item, encoding: str = "utf-8") -> dict:
     """Extract key fields from an Outlook AppointmentItem."""
     return {
         "entry_id": item.EntryID,
-        "subject": item.Subject or "(no subject)",
+        "subject": urllib.parse.unquote(item.Subject, encoding=encoding) if item.Subject else "(no subject)",
         "start": str(item.Start),
         "end": str(item.End),
         "duration": item.Duration,
@@ -67,9 +68,9 @@ def format_event_summary(item) -> dict:
     }
 
 
-def format_event_full(item, body_max_length: int = 5000) -> dict:
+def format_event_full(item, body_max_length: int = 5000, encoding: str = "utf-8") -> dict:
     """Full event details including body."""
-    result = format_event_summary(item)
+    result = format_event_summary(item, encoding=encoding)
     result["body"] = truncate(item.Body or "", body_max_length)
     result["reminder_set"] = bool(item.ReminderSet)
     result["reminder_minutes"] = (
@@ -83,11 +84,11 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
 # --- Task formatting ---
 
 
-def format_task_summary(item) -> dict:
+def format_task_summary(item, encoding: str = "utf-8") -> dict:
     """Extract key fields from an Outlook TaskItem."""
     return {
         "entry_id": item.EntryID,
-        "subject": item.Subject or "(no subject)",
+        "subject": urllib.parse.unquote(item.Subject, encoding=encoding) if item.Subject else "(no subject)",
         "status": TASK_STATUS_NAMES.get(item.Status, "unknown"),
         "percent_complete": item.PercentComplete,
         "due_date": str(item.DueDate) if str(item.DueDate) != "01/01/4501" else None,
@@ -99,9 +100,9 @@ def format_task_summary(item) -> dict:
     }
 
 
-def format_task_full(item, body_max_length: int = 5000) -> dict:
+def format_task_full(item, body_max_length: int = 5000, encoding: str = "utf-8") -> dict:
     """Full task details including body."""
-    result = format_task_summary(item)
+    result = format_task_summary(item, encoding=encoding)
     result["body"] = truncate(item.Body or "", body_max_length)
     result["reminder_set"] = bool(item.ReminderSet)
     result["date_completed"] = (

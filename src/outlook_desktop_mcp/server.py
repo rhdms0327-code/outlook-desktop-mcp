@@ -10,13 +10,16 @@ Entry point: python -m outlook_desktop_mcp.server
 import sys
 import json
 import logging
+import os
+import re
+import urllib.parse
 
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
 from datetime import datetime, timedelta
 
-import os
+import urllib.parse
 
 from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
@@ -88,20 +91,38 @@ bridge = OutlookBridge()
 # --- Helper: resolve folder by name ---
 
 def _resolve_folder(namespace, folder_name: str):
-    """Resolve a folder name to an Outlook MAPIFolder object."""
-    folder_lower = folder_name.lower().strip()
+    """Resolve a folder name or path to an Outlook MAPIFolder object.
+    Supports exact paths like 'Inbox/Updates/News' or recursive search.
+    """
+    folder_str = folder_name.strip()
+    folder_lower = folder_str.lower()
 
     if folder_lower in FOLDER_NAME_TO_ENUM:
         return namespace.GetDefaultFolder(FOLDER_NAME_TO_ENUM[folder_lower])
 
-    # Search root folders by name (handles Archive, custom folders)
     root = namespace.DefaultStore.GetRootFolder()
-    for i in range(root.Folders.Count):
-        f = root.Folders.Item(i + 1)
-        if f.Name.lower() == folder_lower:
-            return f
 
-    return None
+    # Try Strict Path Traversal
+    parts = [p.strip() for p in re.split(r'[/\\]|>', folder_str) if p.strip()]
+    if not parts:
+        return None
+
+    current = root
+    for part in parts:
+        found_child = None
+        for i in range(current.Folders.Count):
+            try:
+                child = current.Folders.Item(i + 1)
+                if child.Name.lower() == part.lower():
+                    found_child = child
+                    break
+            except Exception:
+                continue
+        if not found_child:
+            return None # Strict matching required
+        current = found_child
+    
+    return current if current != root else None
 
 
 # =====================================================================
@@ -165,6 +186,7 @@ async def list_emails(
     folder: str = "inbox",
     count: int = 10,
     unread_only: bool = False,
+    encoding: str = "utf-8",
 ) -> str:
     """List recent emails from a specified Outlook folder.
 
@@ -176,17 +198,17 @@ async def list_emails(
     or to perform actions like mark_as_read, move_email, or reply_email.
 
     Args:
-        folder: The folder to list. Case-insensitive names: "inbox" (default),
-            "sent"/"sentmail", "drafts", "deleted"/"trash", "junk"/"spam",
-            "outbox", "archive", or any custom folder name visible in
-            list_folders output.
+        folder: The EXACT FULL PATH to the folder you want to list. 
+            Case-insensitive. Single name only works for defaults: "inbox", "sent", "trash", etc.
+            Otherwise MUST provide the COMPLETE path to deep folders:
+            Example: "Inbox/Clients/iMBC", "받은 편지함 > 고객사 > iMBC"
         count: Maximum number of emails to return. Default 10, max recommended 50.
         unread_only: If true, only return unread emails. Default false.
 
     Returns:
         JSON array of email summary objects.
     """
-    def _list(outlook, namespace, folder, count, unread_only):
+    def _list(outlook, namespace, folder, count, unread_only, encoding):
         target = _resolve_folder(namespace, folder)
         if not target:
             return json.dumps({"error": f"Folder '{folder}' not found"})
@@ -201,13 +223,13 @@ async def list_emails(
         limit = min(count, items.Count)
         for i in range(limit):
             try:
-                results.append(format_email_summary(items.Item(i + 1)))
+                results.append(format_email_summary(items.Item(i + 1), encoding=encoding))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_list, folder, count, unread_only)
+        return await bridge.call(_list, folder, count, unread_only, encoding)
     except Exception as e:
         return f"Error listing emails: {format_com_error(e)}"
 
@@ -221,6 +243,7 @@ async def read_email(
     entry_id: str = "",
     subject_search: str = "",
     folder: str = "inbox",
+    encoding: str = "utf-8",
 ) -> str:
     """Read the full content of a specific email.
 
@@ -235,16 +258,18 @@ async def read_email(
         subject_search: Alternative to entry_id. A case-insensitive substring
             to search for in email subjects. Returns the most recent match.
         folder: Folder to search when using subject_search. Ignored when
-            entry_id is provided. Default "inbox".
+            entry_id is provided. Default "inbox". To search nested folders,
+            use paths like "Inbox/Clients/iMBC" or "받은 편지함 > 고객사 > iMBC".
+            Must provide EXACT path so AI won't fetch the wrong folder.
 
     Returns:
         JSON object with full email details (entry_id, subject, sender,
         sender_name, received_time, unread, to, cc, body, attachment info).
     """
-    def _read(outlook, namespace, entry_id, subject_search, folder):
+    def _read(outlook, namespace, entry_id, subject_search, folder, encoding):
         if entry_id:
             item = namespace.GetItemFromID(entry_id)
-            return json.dumps(format_email_full(item), indent=2, default=str)
+            return json.dumps(format_email_full(item, encoding=encoding), indent=2, ensure_ascii=False, default=str)
 
         if not subject_search:
             return json.dumps({"error": "Provide either entry_id or subject_search"})
@@ -262,10 +287,10 @@ async def read_email(
         if items.Count == 0:
             return json.dumps({"error": f"No email found matching '{subject_search}'"})
 
-        return json.dumps(format_email_full(items.Item(1)), indent=2, default=str)
+        return json.dumps(format_email_full(items.Item(1), encoding=encoding), indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_read, entry_id, subject_search, folder)
+        return await bridge.call(_read, entry_id, subject_search, folder, encoding)
     except Exception as e:
         return f"Error reading email: {format_com_error(e)}"
 
@@ -349,9 +374,9 @@ async def move_email(
 
     Args:
         entry_id: The unique Outlook EntryID of the email to move.
-        target_folder: Destination folder name. Default is "archive". Supports
-            same names as list_emails: "archive", "inbox", "sent", "deleted"/
-            "trash", "drafts", "junk"/"spam", or any custom folder name.
+        target_folder: Destination folder name or path. Default is "archive".
+            Accepts paths to deep folders MUST INPUT FULL EXACT PATH. Example: "Archive/OldProjects/iMBC", "Inbox > Done".
+            Also accepts simple names if default: "archive", "inbox", "sent", "trash", etc.
 
     Returns:
         Confirmation with email subject and destination, or an error.
@@ -417,7 +442,7 @@ async def reply_email(
 # =====================================================================
 
 @mcp.tool()
-async def list_folders(max_depth: int = 2) -> str:
+async def list_folders(max_depth: int = 4) -> str:
     """List all mail folders in the user's Outlook mailbox.
 
     Returns a JSON array showing the folder hierarchy with item counts.
@@ -427,7 +452,7 @@ async def list_folders(max_depth: int = 2) -> str:
 
     Args:
         max_depth: How many levels deep to recurse into subfolders.
-            Default 2. Set to 1 for top-level only. Max recommended 4.
+            Default 4. Set to 1 for top-level only. User can specify any depth.
 
     Returns:
         JSON array of folder objects with name, item_count, unread_count,
@@ -458,7 +483,7 @@ async def list_folders(max_depth: int = 2) -> str:
         for i in range(root.Folders.Count):
             f = root.Folders.Item(i + 1)
             folders.append(walk(f, 1))
-        return json.dumps(folders, indent=2, default=str)
+        return json.dumps(folders, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(_list, max_depth)
@@ -475,6 +500,7 @@ async def search_emails(
     query: str,
     folder: str = "inbox",
     count: int = 10,
+    encoding: str = "utf-8",
 ) -> str:
     """Search for emails in Outlook using text search.
 
@@ -485,14 +511,15 @@ async def search_emails(
     Args:
         query: The search term (case-insensitive substring match).
             Examples: "budget report", "meeting notes", "quarterly".
-        folder: Folder to search in. Default "inbox". Supports same
-            names as list_emails.
+        folder: Folder to search in. Default "inbox". To search subfolders accurately,
+            provide the FULL EXACT path (e.g. "Inbox/Clients/iMBC" or "받은 편지함 > 고객사 > iMBC").
+            MUST provide full path if searching anything other than top-level defaults.
         count: Maximum results to return. Default 10.
 
     Returns:
         JSON array of matching email summaries, or an error.
     """
-    def _search(outlook, namespace, query, folder, count):
+    def _search(outlook, namespace, query, folder, count, encoding):
         target = _resolve_folder(namespace, folder)
         if not target:
             return json.dumps({"error": f"Folder '{folder}' not found"})
@@ -511,13 +538,13 @@ async def search_emails(
         limit = min(count, items.Count)
         for i in range(limit):
             try:
-                results.append(format_email_summary(items.Item(i + 1)))
+                results.append(format_email_summary(items.Item(i + 1), encoding=encoding))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_search, query, folder, count)
+        return await bridge.call(_search, query, folder, count, encoding)
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
 
@@ -543,6 +570,7 @@ async def list_events(
     start_date: str = "",
     end_date: str = "",
     count: int = 20,
+    encoding: str = "utf-8",
 ) -> str:
     """List upcoming calendar events from Outlook.
 
@@ -563,7 +591,7 @@ async def list_events(
     Returns:
         JSON array of event summary objects.
     """
-    def _list(outlook, namespace, start_date, end_date, count):
+    def _list(outlook, namespace, start_date, end_date, count, encoding):
         calendar = namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
         items = calendar.Items
 
@@ -585,16 +613,16 @@ async def list_events(
         for item in filtered:
             n += 1
             try:
-                results.append(format_event_summary(item))
+                results.append(format_event_summary(item, encoding=encoding))
             except Exception:
                 continue
             if n >= count:
                 break
 
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_list, start_date, end_date, count)
+        return await bridge.call(_list, start_date, end_date, count, encoding)
     except Exception as e:
         return f"Error listing events: {format_com_error(e)}"
 
@@ -604,7 +632,7 @@ async def list_events(
 # =====================================================================
 
 @mcp.tool()
-async def get_event(entry_id: str) -> str:
+async def get_event(entry_id: str, encoding: str = "utf-8") -> str:
     """Read the full details of a specific calendar event.
 
     Retrieves complete event information including body/description,
@@ -617,12 +645,12 @@ async def get_event(entry_id: str) -> str:
     Returns:
         JSON object with full event details.
     """
-    def _get(outlook, namespace, entry_id):
+    def _get(outlook, namespace, entry_id, encoding):
         item = namespace.GetItemFromID(entry_id)
-        return json.dumps(format_event_full(item), indent=2, default=str)
+        return json.dumps(format_event_full(item, encoding=encoding), indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_get, entry_id)
+        return await bridge.call(_get, entry_id, encoding)
     except Exception as e:
         return f"Error reading event: {format_com_error(e)}"
 
@@ -687,7 +715,7 @@ async def create_event(
             "start": str(appt.Start),
             "end": str(appt.End),
             "entry_id": appt.EntryID,
-        }, indent=2, default=str)
+        }, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(
@@ -824,7 +852,7 @@ async def update_event(
             "end": str(item.End),
             "location": item.Location or "",
             "entry_id": item.EntryID,
-        }, indent=2, default=str)
+        }, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(
@@ -929,6 +957,8 @@ async def search_events(
     start_date: str = "",
     end_date: str = "",
     count: int = 10,
+    encoding: str = "utf-8",
+    folder_depth: int = 4,
 ) -> str:
     """Search for calendar events by keyword.
 
@@ -946,7 +976,7 @@ async def search_events(
     Returns:
         JSON array of matching event summaries.
     """
-    def _search(outlook, namespace, query, start_date, end_date, count):
+    def _search(outlook, namespace, query, start_date, end_date, count, encoding):
         calendar = namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
         items = calendar.Items
         items.Sort("[Start]")
@@ -966,16 +996,16 @@ async def search_events(
         for item in filtered:
             if query_lower in (item.Subject or "").lower():
                 try:
-                    results.append(format_event_summary(item))
+                    results.append(format_event_summary(item, encoding=encoding))
                 except Exception:
                     continue
                 if len(results) >= count:
                     break
 
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_search, query, start_date, end_date, count)
+        return await bridge.call(_search, query, start_date, end_date, count, encoding)
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
 
@@ -988,6 +1018,7 @@ async def search_events(
 async def list_tasks(
     include_completed: bool = False,
     count: int = 20,
+    encoding: str = "utf-8",
 ) -> str:
     """List tasks from the Outlook Tasks folder.
 
@@ -1003,7 +1034,7 @@ async def list_tasks(
     Returns:
         JSON array of task summary objects.
     """
-    def _list(outlook, namespace, include_completed, count):
+    def _list(outlook, namespace, include_completed, count, encoding):
         folder = namespace.GetDefaultFolder(OL_FOLDER_TASKS)
         items = folder.Items
         items.Sort("[DueDate]")
@@ -1015,19 +1046,19 @@ async def list_tasks(
         limit = min(count, items.Count)
         for i in range(limit):
             try:
-                results.append(format_task_summary(items.Item(i + 1)))
+                results.append(format_task_summary(items.Item(i + 1), encoding=encoding))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_list, include_completed, count)
+        return await bridge.call(_list, include_completed, count, encoding)
     except Exception as e:
         return f"Error listing tasks: {format_com_error(e)}"
 
 
 @mcp.tool()
-async def get_task(entry_id: str) -> str:
+async def get_task(entry_id: str, encoding: str = "utf-8") -> str:
     """Read the full details of a specific task.
 
     Args:
@@ -1036,12 +1067,12 @@ async def get_task(entry_id: str) -> str:
     Returns:
         JSON object with full task details including body.
     """
-    def _get(outlook, namespace, entry_id):
+    def _get(outlook, namespace, entry_id, encoding):
         item = namespace.GetItemFromID(entry_id)
-        return json.dumps(format_task_full(item), indent=2, default=str)
+        return json.dumps(format_task_full(item, encoding=encoding), indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_get, entry_id)
+        return await bridge.call(_get, entry_id, encoding)
     except Exception as e:
         return f"Error reading task: {format_com_error(e)}"
 
@@ -1088,7 +1119,7 @@ async def create_task(
             "subject": task.Subject,
             "entry_id": task.EntryID,
             "due_date": str(task.DueDate) if due_date else None,
-        }, indent=2, default=str)
+        }, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(
@@ -1150,7 +1181,7 @@ async def delete_task(entry_id: str) -> str:
 # =====================================================================
 
 @mcp.tool()
-async def list_attachments(entry_id: str) -> str:
+async def list_attachments(entry_id: str, encoding: str = "utf-8") -> str:
     """List all attachments on an email or calendar event.
 
     Args:
@@ -1159,20 +1190,20 @@ async def list_attachments(entry_id: str) -> str:
     Returns:
         JSON array of attachment objects with index, filename, and size.
     """
-    def _list(outlook, namespace, entry_id):
+    def _list(outlook, namespace, entry_id, encoding):
         item = namespace.GetItemFromID(entry_id)
         results = []
         for i in range(item.Attachments.Count):
             att = item.Attachments.Item(i + 1)
             results.append({
                 "index": i + 1,
-                "filename": att.FileName,
+                "filename": urllib.parse.unquote(att.FileName, encoding=encoding),
                 "size": att.Size,
             })
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_list, entry_id)
+        return await bridge.call(_list, entry_id, encoding)
     except Exception as e:
         return f"Error listing attachments: {format_com_error(e)}"
 
@@ -1182,6 +1213,7 @@ async def save_attachment(
     entry_id: str,
     attachment_index: int = 1,
     save_directory: str = "",
+    encoding: str = "utf-8",
 ) -> str:
     """Save an attachment from an email or event to disk.
 
@@ -1197,7 +1229,7 @@ async def save_attachment(
     Returns:
         The full file path where the attachment was saved, or an error.
     """
-    def _save(outlook, namespace, entry_id, attachment_index, save_directory):
+    def _save(outlook, namespace, entry_id, attachment_index, save_directory, encoding):
         item = namespace.GetItemFromID(entry_id)
         if item.Attachments.Count < attachment_index:
             return f"Error: Only {item.Attachments.Count} attachment(s), requested index {attachment_index}"
@@ -1205,18 +1237,27 @@ async def save_attachment(
         att = item.Attachments.Item(attachment_index)
         if not save_directory:
             save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
-        os.makedirs(save_directory, exist_ok=True)
-        save_path = os.path.join(save_directory, att.FileName)
+        
+        # URL 디코딩 및 OS에 맞는 경로 통합 적용
+        clean_filename = urllib.parse.unquote(att.FileName, encoding=encoding)
+        
+        # 윈도우(\), 유닉스(/) 슬래시 혼용 방지를 위한 기준 정규화
+        normalized_filename = clean_filename.replace("/", os.sep).replace("\\", os.sep)
+        save_path = os.path.normpath(os.path.join(save_directory, os.path.basename(normalized_filename)))
+        
+        # 상위 디렉터리 보장
+        os.makedirs(os.path.dirname(save_path) or save_directory, exist_ok=True)
+        
         att.SaveAsFile(save_path)
         return json.dumps({
             "status": "saved",
-            "filename": att.FileName,
+            "filename": clean_filename,
             "path": save_path,
             "size": att.Size,
-        }, indent=2, default=str)
+        }, indent=2, ensure_ascii=False, default=str)
 
     try:
-        return await bridge.call(_save, entry_id, attachment_index, save_directory)
+        return await bridge.call(_save, entry_id, attachment_index, save_directory, encoding)
     except Exception as e:
         return f"Error saving attachment: {format_com_error(e)}"
 
@@ -1240,7 +1281,7 @@ async def list_categories() -> str:
         for i in range(namespace.Categories.Count):
             cat = namespace.Categories.Item(i + 1)
             results.append({"name": cat.Name, "color": cat.Color})
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(_list)
@@ -1306,7 +1347,7 @@ async def list_rules() -> str:
                 "name": rule.Name,
                 "enabled": bool(rule.Enabled),
             })
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(results, indent=2, ensure_ascii=False, default=str)
 
     try:
         return await bridge.call(_list)
@@ -1368,13 +1409,13 @@ async def get_out_of_office() -> str:
             return json.dumps({
                 "out_of_office": bool(oof_state),
                 "status": "on" if oof_state else "off",
-            }, indent=2)
+            }, indent=2, ensure_ascii=False)
         except Exception:
             return json.dumps({
                 "out_of_office": None,
                 "status": "unknown",
                 "note": "Could not read OOF property. Check Outlook settings directly.",
-            }, indent=2)
+            }, indent=2, ensure_ascii=False)
 
     try:
         return await bridge.call(_get)
